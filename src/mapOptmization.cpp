@@ -362,19 +362,15 @@ public:
         return thisPose6D;
     }
 
+    std::string currentDateTime() {
+        auto now = std::chrono::system_clock::now();
+        std::time_t now_time = std::chrono::system_clock::to_time_t(now);
+        std::tm tm = *std::localtime(&now_time);        
     
-
-
-
-
-
-
-
-
-
-
-
-
+        std::ostringstream oss;
+        oss << std::put_time(&tm, "_%Y_%m_%d_%H_%M_%S");
+        return oss.str();
+    }
 
     bool saveMapService(liorf::save_mapRequest& req, liorf::save_mapResponse& res)
     {
@@ -383,14 +379,15 @@ public:
       cout << "****************************************************" << endl;
       cout << "Saving map to pcd files ..." << endl;
       if(req.destination.empty()) saveMapDirectory = std::getenv("HOME") + savePCDDirectory;
-      else saveMapDirectory = std::getenv("HOME") + req.destination;
+      else saveMapDirectory = req.destination;
       cout << "Save destination: " << saveMapDirectory << endl;
       // create directory and remove old files;
-      int unused = system((std::string("exec rm -r ") + saveMapDirectory).c_str());
-      unused = system((std::string("mkdir -p ") + saveMapDirectory).c_str());
+      std::string timestamp = currentDateTime();
+    //   int unused = system((std::string("exec rm -r ") + saveMapDirectory).c_str());
+    //   unused = system((std::string("mkdir -p ") + saveMapDirectory).c_str());
       // save key frame transformations
-      pcl::io::savePCDFileBinary(saveMapDirectory + "/trajectory.pcd", *cloudKeyPoses3D);
-      pcl::io::savePCDFileBinary(saveMapDirectory + "/transformations.pcd", *cloudKeyPoses6D);
+      pcl::io::savePCDFileBinary(saveMapDirectory + "/trajectory" + timestamp + ".pcd", *cloudKeyPoses3D);
+      pcl::io::savePCDFileBinary(saveMapDirectory + "/transformations" + timestamp + ".pcd", *cloudKeyPoses6D);
       // extract global point cloud map
 
       pcl::PointCloud<PointType>::Ptr globalSurfCloud(new pcl::PointCloud<PointType>());
@@ -408,19 +405,19 @@ public:
         downSizeFilterSurf.setInputCloud(globalSurfCloud);
         downSizeFilterSurf.setLeafSize(req.resolution, req.resolution, req.resolution);
         downSizeFilterSurf.filter(*globalSurfCloudDS);
-        pcl::io::savePCDFileBinary(saveMapDirectory + "/SurfMap.pcd", *globalSurfCloudDS);
+        pcl::io::savePCDFileBinary(saveMapDirectory + "/SurfMap" + timestamp + ".pcd", *globalSurfCloudDS);
       }
       else
       {
 
         // save surf cloud
-        pcl::io::savePCDFileBinary(saveMapDirectory + "/SurfMap.pcd", *globalSurfCloud);
+        pcl::io::savePCDFileBinary(saveMapDirectory + "/SurfMap"+ timestamp +".pcd", *globalSurfCloud);
       }
 
       // save global point cloud map
       *globalMapCloud += *globalSurfCloud;
 
-      int ret = pcl::io::savePCDFileBinary(saveMapDirectory + "/GlobalMap.pcd", *globalMapCloud);
+      int ret = pcl::io::savePCDFileBinary(saveMapDirectory + "/GlobalMap"+ timestamp +".pcd", *globalMapCloud);
       res.success = ret == 0;
 
       downSizeFilterSurf.setLeafSize(mappingSurfLeafSize, mappingSurfLeafSize, mappingSurfLeafSize);
@@ -430,6 +427,8 @@ public:
 
       return true;
     }
+
+    
 
     void visualizeGlobalMapThread()
     {
