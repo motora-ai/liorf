@@ -59,6 +59,19 @@ enum class SCInputType
     MULTI_SCAN_FEAT 
 }; 
 
+/**
+ * @class mapOptimization
+ * @brief Gerencia a otimização de back-end e o mapeamento para o sistema SLAM LIORF.
+ *
+ * Esta classe é responsável por várias tarefas centrais do SLAM:
+ * - Realizar a otimização scan-to-map para refinar a pose do robô.
+ * - Gerenciar um grafo de poses usando GTSAM (especificamente iSAM2) para consistência global.
+ * - Detectar e processar fechamentos de loop (loop closures) usando ScanContext e ICP.
+ * - Armazenar e gerenciar keyframes e suas nuvens de pontos associadas.
+ * - Publicar a trajetória otimizada, o mapa global e outras informações relevantes do SLAM.
+ *
+ * Ela herda de ParamServer para acessar convenientemente todos os parâmetros do nó.
+ */
 class mapOptimization : public ParamServer
 {
 
@@ -161,7 +174,197 @@ public:
     // scancontext loop closure
     SCManager scManager;
 
-    mapOptimization()
+    // methods
+    /**
+     * @brief Atualiza a estimativa inicial de pose (initial guess) para a otimização scan-to-map.
+     *
+     * @details Esta função é chamada no início de cada iteração de mapeamento para
+     * estimar onde o robô está *antes* de executar a otimização scan-to-map.
+     * Ela atualiza a variável de estado `transformTobeMapped` usando a melhor fonte de
+     * odometria incremental disponível:
+     *
+     * 1.  **Inicialização (Primeiro Frame):** Se for o primeiro keyframe (sem poses salvas),
+     * define a pose inicial usando a orientação inicial do IMU (roll, pitch, yaw)
+     * fornecida pela `cloudInfo`. A translação é definida como (0,0,0).
+     *
+     * 2.  **Odometria de Pré-integração IMU:** Se `cloudInfo.odomAvailable` for verdadeiro,
+     * a função usa a estimativa de odometria incremental da pré-integração
+     * do IMU (fornecida pelo front-end) para propagar a pose. Ela calcula
+     * a transformação incremental desde a última chamada e a aplica à
+     * pose otimizada anterior (o valor atual de `transformTobeMapped`).
+     *
+     * 3.  **Rotação Incremental IMU:** Se a pré-integração não estiver disponível
+     * (`odomAvailable` == false) mas os dados brutos do IMU estiverem
+     * (`imuAvailable` == true), a função usa apenas a *mudança rotacional*
+     * incremental do IMU para atualizar a orientação da estimativa inicial.
+     * A translação não é alterada neste caso (modelo "rotation-only").
+     *
+     * 4.  **Fallback (Velocidade Constante):** Se nenhum dado do IMU/Odom for usado,
+     * `transformTobeMapped` simplesmente retém seu valor anterior (a última
+     * pose otimizada), o que age como um modelo de "velocidade constante zero".
+     *
+     * @note No início da função, a pose atual (antes de qualquer atualização) é salva em
+     * `incrementalOdometryAffineFront` para referência. As variáveis estáticas
+     * `lastImuTransformation`, `lastImuPreTransAvailable` e `lastImuPreTransformation`
+     * são usadas para rastrear o estado entre as chamadas.
+     */
+    void updateInitialGuess();
+    
+    /**
+     * @brief Constrói o mapa local (submap) para a otimização scan-to-map.
+     *
+     * @details Esta função é responsável por selecionar um subconjunto relevante de
+     * keyframes globais para construir o mapa local (`laserCloudSurfFromMap`) 
+     * contra o qual o scan atual será registrado.
+     *
+     * O processo é delegado à função `extractNearby()` (chamada incondicionalmente):
+     * 1.  **Verificação Inicial:** Retorna imediatamente se nenhum keyframe foi salvo ainda
+     * (`cloudKeyPoses3D` está vazio).
+     * 2.  **Busca Espacial:** Realiza uma busca por raio (`surroundingKeyframeSearchRadius`)
+     * no KD-tree de poses (`kdtreeSurroundingKeyPoses`) para encontrar todas as
+     * poses-chave próximas à pose-chave mais recente (`cloudKeyPoses3D->back()`).
+     * 3.  **Downsampling de Poses:** As poses encontradas são filtradas/downsampled
+     * usando `downSizeFilterSurroundingKeyPoses` para garantir uma densidade
+     * controlada de keyframes no mapa local. O índice original do keyframe
+     * (armazenado na `intensity`) é restaurado após o filtro.
+     * 4.  **Busca Temporal:** Para lidar com casos em que o robô rotaciona
+     * mas não se move (o que poderia resultar em poucos keyframes espaciais),
+     * a função também adiciona todas as poses-chave que ocorreram nos
+     * últimos 10 segundos, independentemente de sua distância.
+     * 5.  **Extração da Nuvem:** Finalmente, chama `extractCloud()` passando a lista
+     * filtrada de poses (espaciais + temporais). `extractCloud()` então
+     * carrega as nuvens de pontos de features (`surfCloudKeyFrames`)
+     * correspondentes a essas poses e as monta no mapa local
+     * (`laserCloudSurfFromMapDS`).
+     *
+     * @note O código contém lógica comentada que sugere uma seleção alternativa
+     * (`extractForLoopClosure`) baseada no `loopClosureEnableFlag`, mas na
+     * implementação atual, `extractNearby()` é chamado incondicionalmente.
+     */
+    void extractSurroundingKeyFrames();
+
+    /**
+     * @brief Reduz a densidade da nuvem de pontos de features do scan atual.
+     *
+     * @details Esta função utiliza um filtro VoxelGrid (definido em `downSizeFilterSurf`) 
+     * para aplicar downsampling na nuvem de features 'surf' recebida 
+     * (`laserCloudSurfLast`). A nuvem de pontos resultante, com densidade 
+     * reduzida, é armazenada em `laserCloudSurfLastDS`.
+     *
+     * O número de pontos na nuvem filtrada é então salvo em 
+     * `laserCloudSurfLastDSNum` para referência futura. Este passo é crucial 
+     * para reduzir o custo computacional da subsequente otimização 
+     * scan-to-map.
+     */
+    void downsampleCurrentScan();
+
+    /**
+     * @brief Executa a otimização scan-to-map (registro ponto-a-plano).
+     *
+     * @details Esta é a função central de otimização do back-end, responsável por
+     * alinhar o scan atual (`laserCloudSurfLastDS`) com o mapa local
+     * (`laserCloudSurfFromMapDS`). Ela refina a estimativa de pose
+     * `transformTobeMapped` minimizando os erros ponto-a-plano.
+     *
+     * O processo segue os seguintes passos:
+     * 1.  **Verificação de Condições:** Retorna imediatamente se não houver keyframes
+     * anteriores ou se o número de features 'surf' no scan atual
+     * (`laserCloudSurfLastDSNum`) for muito baixo (menor que 30).
+     * 2.  **Preparação:** Configura o KD-tree (`kdtreeSurfFromMap`) com os pontos
+     * do mapa local para busca rápida de vizinhos.
+     * 3.  **Otimização Iterativa (Levenberg-Marquardt):** Inicia um loop de
+     * otimização (máx. 30 iterações):
+     * a.  `surfOptimization()`: Encontra correspondências (pontos no scan
+     * para planos no mapa) e calcula os coeficientes da otimização
+     * (resíduos e Jacobianos).
+     * b.  `combineOptimizationCoeffs()`: Agrega os coeficientes
+     * (provavelmente de threads paralelas).
+     * c.  `LMOptimization()`: Executa um passo do solver Levenberg-Marquardt
+     * para calcular uma atualização de pose. Se a otimização
+     * convergir (mudança pequena), retorna `true` e o loop é
+     * interrompido.
+     * 4.  **Atualização Final:** Após o loop (seja por convergência ou por
+     * número máximo de iterações), `transformUpdate()` é chamado para
+     * aplicar a transformação de pose otimizada à variável de estado
+     * `transformTobeMapped`.
+     */
+    void scan2MapOptimization();
+
+    /**
+     * @brief Salva o scan atual como um novo keyframe e atualiza o grafo de fatores (GTSAM).
+     *
+     * @details Esta função é chamada após a otimização scan-to-map (`scan2MapOptimization`)
+     * ter sido concluída com sucesso. Ela é responsável por "confirmar" o scan atual
+     * como um novo nó no grafo de pose global.
+     *
+     * O processo segue os seguintes passos:
+     * 1.  **Verificação de Keyframe:** Chama `saveFrame()` para determinar se o
+     * movimento desde o último keyframe é significativo o suficiente. Se não
+     * for, a função retorna e nenhum keyframe é salvo.
+     * 2.  **Adição de Fatores:** Se for um keyframe válido, novos fatores são
+     * adicionados ao `gtSAMgraph` temporário:
+     * - `addOdomFactor()`: Adiciona uma restrição de odometria entre este
+     * keyframe e o anterior.
+     * - `addGPSFactor()`: Adiciona uma restrição de prior global (fator unário)
+     * se um dado de GPS alinhado estiver disponível.
+     * - `addLoopFactor()`: Adiciona uma restrição de fechamento de loop (fator
+     * binário) se uma detecção de loop estiver na fila.
+     * 3.  **Atualização do iSAM2:** O grafo temporário (`gtSAMgraph`) e as
+     * estimativas iniciais (`initialEstimate`) são passados para o solver
+     * iSAM2 (`isam->update()`), que realiza a otimização incremental.
+     * 4.  **Convergência de Loop:** Se um fechamento de loop foi adicionado
+     * (`aLoopIsClosed == true`), o `isam->update()` é chamado múltiplas
+     * vezes para garantir que a solução convirja e que as correções
+     * se propaguem pelo grafo.
+     * 5.  **Limpeza:** O grafo temporário e as estimativas são limpos (`resize(0)`,
+     * `clear()`), pois o estado agora é gerenciado internamente pelo iSAM2.
+     * 6.  **Recuperação da Pose Otimizada:** A pose mais recente e otimizada
+     * é recuperada do solver (`isam->calculateEstimate()`).
+     * 7.  **Armazenamento de Poses:** A pose otimizada é salva em `cloudKeyPoses3D`
+     * (para buscas espaciais) e `cloudKeyPoses6D` (para dados completos 6DOF + tempo).
+     * 8.  **Atualização de Estado:** A variável de estado principal `transformTobeMapped`
+     * é atualizada com esta nova pose otimizada.
+     * 9.  **Armazenamento da Nuvem:** A nuvem de pontos de features (`laserCloudSurfLastDS`)
+     * é copiada e armazenada no vetor `surfCloudKeyFrames`.
+     * 10. **Scan Context:** Um descritor Scan Context é gerado (`scManager`)
+     * para o novo keyframe para permitir futuras detecções de fechamento de loop.
+     * 11. **Visualização:** O caminho global (`globalPath`) é atualizado com a nova
+     * pose para publicação no ROS (`updatePath`).
+     *
+     * @note O campo `intensity` de `cloudKeyPoses3D` é usado para armazenar o
+     * índice do keyframe (um inteiro), permitindo buscas rápidas em KD-tree
+     * que retornam o índice da pose.
+     */
+    void saveKeyFramesAndFactor();
+
+    /**
+     * @brief Atualiza todas as poses de keyframes armazenadas após uma otimização de fechamento de loop.
+     *
+     * @details Esta função é chamada em cada iteração do loop de mapeamento, mas
+     * seu conteúdo principal só é executado se a flag `aLoopIsClosed` for `true`.
+     * Quando um fechamento de loop é processado, o solver iSAM2 recalcula e
+     * ajusta *todas* as poses no grafo para garantir a consistência global.
+     *
+     * Esta função é responsável por propagar essas correções de volta para
+     * as estruturas de dados locais (as nuvens de pontos de poses):
+     *
+     * 1.  **Limpa Caches:** Invalida e limpa o cache de nuvens de pontos do mapa
+     * (`laserCloudMapContainer`) e o caminho de visualização (`globalPath`),
+     * pois as poses antigas estão agora incorretas.
+     * 2.  **Itera e Corrige:** Percorre *todas* as poses na estimativa atual do iSAM
+     * (`isamCurrentEstimate`), do início ao fim (índice 0 até `numPoses`).
+     * 3.  **Atualiza Poses:** Para cada índice `i`, a pose armazenada em
+     * `cloudKeyPoses3D->points[i]` (para busca) e `cloudKeyPoses6D->points[i]`
+     * (para dados 6DOF) é sobrescrita com a translação e rotação corrigidas
+     * vindas do solver.
+     * 4.  **Recria Caminho:** O `globalPath` é reconstruído ponto a ponto usando
+     * as novas poses corrigidas.
+     * 5.  **Reseta Flag:** A flag `aLoopIsClosed` é definida como `false`, indicando
+     * que a correção pós-loop foi concluída.
+     */
+    void correctPoses();
+
+    void mapOptimization()
     {
         ISAM2Params parameters;
         parameters.relinearizeThreshold = 0.1;

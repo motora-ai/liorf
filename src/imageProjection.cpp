@@ -61,6 +61,32 @@ using PointXYZIRT = VelodynePointXYZIRT;
 
 const int queueLength = 2000;
 
+/**
+ * @class ImageProjection
+ * @brief Processa dados brutos do LiDAR para deskewing e preparação de features.
+ *
+ * Esta classe atua como o "front-end" do sistema SLAM. Suas principais
+ * responsabilidades são:
+ *
+ * 1.  **Sincronização:** Inscreve-se nos tópicos de nuvem de pontos bruta 
+ * (`subLaserCloud`), IMU (`subImu`) e odometria (`subOdom`), e armazena
+ * as mensagens em filas (`cloudQueue`, `imuQueue`, `odomQueue`) para 
+ * alinhamento temporal.
+ * 2.  **Compensação de Movimento (Deskewing):** Utiliza dados de alta frequência
+ * do IMU (ou odometria, se `odomDeskewFlag` for verdadeiro) para corrigir a
+ * distorção na nuvem de pontos causada pelo movimento do robô *durante* a
+ * aquisição do scan.
+ * 3.  **Abstração de Sensor:** Consegue lidar com diferentes formatos de
+ * nuvem de pontos (ex: Ouster, Mulran) e convertê-los para um formato PCL
+ * interno padrão (`PointType`).
+ * 4.  **Projeção e Empacotamento:** Projeta a nuvem de pontos (provavelmente
+ * em uma imagem de profundidade interna, como sugerido pelo nome) para
+ * organizar os pontos. Em seguida, empacota todos os dados processados
+ * (nuvem completa deskewed, estado do IMU, etc.) na mensagem customizada
+ * `liorf::cloud_info` e a publica.
+ *
+ * Herda de `ParamServer` para acessar parâmetros de configuração do ROS.
+ */
 class ImageProjection : public ParamServer
 {
 private:
@@ -80,7 +106,7 @@ private:
     ros::Subscriber subOdom;
     std::deque<nav_msgs::Odometry> odomQueue;
 
-    std::deque<sensor_msgs::PointCloud2> cloudQueue;
+    std::deque<sensor_msgs::PointCloud2> cloudQueue_;
     sensor_msgs::PointCloud2 currentCloudMsg;
 
     double *imuTime = new double[queueLength];
@@ -108,6 +134,75 @@ private:
     double timeScanCur;
     double timeScanEnd;
     std_msgs::Header cloudHeader;
+
+    // methods
+    /**
+     * @brief Processa a nuvem de entrada bruta para filtrar, fazer downsample e corrigir distorções (deskew).
+     *
+     * @details Esta função é o núcleo do processamento do front-end. Ela itera
+     * por todos os pontos da nuvem de entrada (`laserCloudIn`), que já foi
+     * convertida para o formato PCL com timestamps por ponto (`PointXYZIRT`).
+     *
+     * O processo para cada ponto é o seguinte:
+     * 1.  **Cópia Inicial:** Os dados do ponto (x, y, z, intensity) são copiados.
+     * 2.  **Filtragem por Range:** Pontos muito próximos (`< lidarMinRange`) ou
+     * muito distantes (`> lidarMaxRange`) são descartados.
+     * 3.  **Filtragem por Anel (Ring):** Pontos com um ID de anel (laser) inválido
+     * (fora de `[0, N_SCAN)`) são descartados.
+     * 4.  **Downsampling de Anel:** Apenas os anéis que são múltiplos de
+     * `downsampleRate` são mantidos (ex: anéis 0, 2, 4... se `downsampleRate` for 2).
+     * Isso reduz a resolução vertical.
+     * 5.  **Downsampling de Ponto:** Apenas os pontos cujo índice na nuvem original
+     * é múltiplo de `point_filter_num` são mantidos. Isso reduz a
+     * resolução horizontal (ou temporal).
+     * 6.  **Deskewing (Compensação de Movimento):** Para os pontos que passam em
+     * todos os filtros, a função `deskewPoint()` é chamada. Esta função
+     * usa o timestamp do ponto (`laserCloudIn->points[i].time`) e os
+     * dados de IMU/Odom interpolados para calcular a posição 3D corrigida
+     * do ponto, efetivamente "movendo-o" para o frame do início do scan.
+     * 7.  **Armazenamento:** O ponto corrigido (deskewed) e filtrado é
+     * adicionado à nuvem de pontos de saída `fullCloud`.
+     */
+    void projectPointCloud();
+    
+    /**
+     * @brief Armazena em cache, faz o 'deque' e converte a nuvem de pontos bruta do ROS para o formato PCL.
+     *
+     * @details Esta função atua como a entrada principal de dados da nuvem de pontos para a classe.
+     * 1.  **Buffering:** Adiciona a mensagem recebida (`laserCloudMsg`) ao `cloudQueue`.
+     * Ele requer um buffer de pelo menos 3 mensagens (`cloudQueue.size() <= 2` 
+     * retorna falso) antes de processar; isso ajuda a garantir que os dados
+     * de IMU/Odom estejam disponíveis em torno do tempo da nuvem.
+     * 2.  **Dequeuing:** Retira a mensagem *mais antiga* da fila (`cloudQueue.front()`)
+     * para `currentCloudMsg` para processamento.
+     * 3.  **Conversão de Sensor (Abstração):** Este é um passo crítico de "adaptador".
+     * Ele converte o formato de nuvem de pontos ROS específico do sensor 
+     * para o formato PCL interno padrão `pcl::PointCloud<PointXYZIRT>`
+     * (`laserCloudIn`).
+     * 4.  **Cálculo de Tempo de Ponto:** Para sensores como Ouster, Mulran e Robosense,
+     * ele itera manualmente sobre os pontos para calcular o *timestamp relativo*
+     * de cada ponto (em segundos, desde o início do scan) e o armazena
+     * no campo `dst.time`. Isso é essencial para o deskewing.
+     * 5.  **Extração de Tempo de Scan:** Armazena o cabeçalho (`cloudHeader`) e 
+     * extrai o timestamp de início do scan (`timeScanCur`). Calcula o 
+     * timestamp de fim (`timeScanEnd`) somando o tempo relativo do último 
+     * ponto.
+     * 6.  **Verificações de Sanidade (Críticas):**
+     * - Verifica se a nuvem é `dense` (sem NaNs).
+     * - Na primeira execução, verifica se o campo "ring" existe (necessário
+     * para projeção).
+     * - Na primeira execução, verifica se um campo de tempo ("time" ou "t")
+     * existe (necessário para deskewing). Se não, o deskewing é
+     * desabilitado com um aviso.
+     *
+     * @param laserCloudMsg O ponteiro const para a mensagem `sensor_msgs::PointCloud2`
+     * bruta recebida do driver do LiDAR.
+     * @return bool Retorna `true` se uma nuvem foi com sucesso retirada da fila,
+     * convertida e passou em todas as verificações (pronta para `projectPointCloud`).
+     * Retorna `false` se a fila ainda está sendo preenchida
+     * (tamanho <= 2).
+     */
+    bool cachePointCloud(const sensor_msgs::PointCloud2ConstPtr& laserCloudMsg);
 
 public:
     ImageProjection():

@@ -388,9 +388,8 @@ public:
         : imuRate_(imuRate)
     {
         // Setup IMU-Lidar transforms
-        imu2Lidar = gtsam::Pose3(gtsam::Rot3::RzRyRx(extRot.z(), extRot.y(), extRot.x()), 
-                                gtsam::Point3(extTrans.x(), extTrans.y(), extTrans.z()));
-        lidar2Imu = imu2Lidar.inverse();
+        imu2Lidar = gtsam::Pose3(gtsam::Rot3(1, 0, 0, 0), gtsam::Point3(-extTrans.x(), -extTrans.y(), -extTrans.z()));
+        lidar2Imu = gtsam::Pose3(gtsam::Rot3(1, 0, 0, 0), gtsam::Point3(extTrans.x(), extTrans.y(), extTrans.z()));
 
         // Setup IMU preintegration parameters
         boost::shared_ptr<gtsam::PreintegrationParams> p = gtsam::PreintegrationParams::MakeSharedU(imuGravity);
